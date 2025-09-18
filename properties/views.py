@@ -7,6 +7,7 @@ Implements OpenAPI 3.0 specification from shopwindow-api-spec.txt
 
 from django.db import transaction
 from django.db.models import Q, Count, Avg, Sum
+from django.db.models.functions import Distance
 from django.shortcuts import get_object_or_404
 from django.contrib.gis.measure import D
 from django.contrib.gis.geos import Point
@@ -14,6 +15,7 @@ from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
 
 from rest_framework import status, generics, filters
 from rest_framework.decorators import api_view, permission_classes
@@ -419,18 +421,29 @@ def nearby_properties(request):
         
         # Create point and find nearby properties
         point = Point(lng, lat, srid=4326)  # Note: Point(lng, lat) order
+        
+        # Filter properties with coordinates and calculate distance
         nearby = ShoppingCenter.objects.filter(
             latitude__isnull=False,
             longitude__isnull=False
-        ).annotate(
-            distance=models.functions.Distance('geolocation', point)
-        ).filter(
-            distance__lte=D(mi=radius_miles)
+        ).extra(
+            select={
+                'distance': """
+                    ST_Distance(
+                        ST_MakePoint(longitude, latitude)::geography,
+                        ST_MakePoint(%s, %s)::geography
+                    ) / 1609.34
+                """  # Convert meters to miles
+            },
+            select_params=[lng, lat]
+        ).extra(
+            where=['ST_Distance(ST_MakePoint(longitude, latitude)::geography, ST_MakePoint(%s, %s)::geography) / 1609.34 <= %s'],
+            params=[lng, lat, radius_miles]
         ).order_by('distance')[:50]  # Limit to 50 results
         
         serializer = ShoppingCenterSerializer(nearby, many=True)
         return Response({
-            'count': nearby.count(),
+            'count': len(nearby),
             'radius_miles': radius_miles,
             'center_point': {'lat': lat, 'lng': lng},
             'results': serializer.data
