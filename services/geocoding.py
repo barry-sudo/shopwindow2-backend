@@ -1,832 +1,985 @@
 """
-Geocoding Service for Shop Window Application.
+Properties Filters - Shop Window Backend API
+Django REST Framework filters for shopping centers and tenants.
 
-This module provides comprehensive address geocoding functionality using
-the Google Maps API. Transforms shopping center addresses into precise
-coordinates for mapping, spatial analysis, and business intelligence.
+Provides comprehensive filtering capabilities for:
+- Geographic filtering (city, state, bounds)
+- Size and type filtering (GLA, center type)
+- Data quality filtering (quality scores, completeness)
+- Business relationship filtering (owner, property manager)
+- Tenant-specific filtering (occupancy, categories)
+- Date and time filtering (creation, updates, lease terms)
 
-Key Features:
-- Google Maps API integration with rate limiting
-- Address validation and cleaning before geocoding
-- PostGIS Point field integration for spatial queries
-- Batch geocoding operations for efficiency
-- Caching to minimize API calls and costs
-- Comprehensive error handling and logging
-- Fallback mechanisms for failed requests
-- Integration with business logic address validation
-
-Production Considerations:
-- API key security and rotation
-- Rate limiting and quota management
-- Error recovery and retry logic
-- Performance optimization for bulk operations
-- Cost monitoring and usage analytics
+Supports the progressive data enrichment philosophy by allowing
+filtering based on EXTRACT, DETERMINE, and DEFINE field categories.
 """
 
-import googlemaps
-import logging
-import time
-import hashlib
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from django_filters import rest_framework as filters
+from django_filters import CharFilter, NumberFilter, BooleanFilter, DateFilter, ChoiceFilter
+from django.db import models
+from django.contrib.gis.geos import Point
+from django.contrib.gis.measure import D
 from decimal import Decimal
 
-from django.conf import settings
-from django.core.cache import cache
-from django.contrib.gis.geos import Point
-from django.db import transaction
-from django.utils import timezone
-
-from .business_logic import validate_address_components, clean_street_address
-
-logger = logging.getLogger(__name__)
+from .models import ShoppingCenter, Tenant
 
 
 # =============================================================================
-# DATA CLASSES FOR GEOCODING RESULTS
+# SHOPPING CENTER FILTERS
 # =============================================================================
 
-@dataclass
-class GeocodingResult:
-    """Structured result from geocoding operation."""
-    success: bool
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    formatted_address: Optional[str] = None
-    place_id: Optional[str] = None
-    address_components: Optional[Dict] = None
-    geometry_type: Optional[str] = None
-    location_type: Optional[str] = None
-    viewport: Optional[Dict] = None
-    error_message: Optional[str] = None
-    api_status: Optional[str] = None
-    confidence_score: float = 0.0
-
-
-@dataclass  
-class BatchGeocodingResult:
-    """Results from batch geocoding operation."""
-    total_addresses: int
-    successful_geocodes: int
-    failed_geocodes: int
-    api_calls_used: int
-    processing_time_seconds: float
-    results: List[Tuple[int, GeocodingResult]]  # (shopping_center_id, result)
-    errors: List[str]
-
-
-@dataclass
-class GeocodingQuotaStatus:
-    """Current API quota and usage status."""
-    daily_limit: int
-    current_usage: int
-    remaining_requests: int
-    reset_time: datetime
-    rate_limit_per_second: int
-    estimated_cost_usd: float
-
-
-# =============================================================================
-# MAIN GEOCODING SERVICE
-# =============================================================================
-
-class GeocodingService:
+class ShoppingCenterFilter(filters.FilterSet):
     """
-    Comprehensive geocoding service with Google Maps API integration.
+    Comprehensive filtering for shopping centers with spatial and business logic support.
     
-    Handles individual and batch geocoding operations with intelligent
-    caching, error handling, and rate limiting.
+    Provides filtering capabilities for:
+    - Location-based filtering (city, state, geographic bounds)
+    - Size-based filtering (GLA ranges, center types)
+    - Data quality filtering (completeness scores)
+    - Business relationship filtering (ownership, management)
+    - Spatial proximity filtering (nearby properties)
     """
     
-    def __init__(self):
-        """Initialize geocoding service with Google Maps client."""
-        try:
-            self.api_key = settings.GOOGLE_MAPS_API_KEY
-            if not self.api_key:
-                raise ValueError("Google Maps API key not configured in settings")
-            
-            self.client = googlemaps.Client(key=self.api_key)
-            
-            # Configuration from settings with defaults
-            self.requests_per_day = getattr(settings, 'GOOGLE_MAPS_REQUESTS_PER_DAY', 40000)
-            self.requests_per_second = getattr(settings, 'GOOGLE_MAPS_REQUESTS_PER_SECOND', 50)
-            
-            # Cache configuration
-            self.cache_timeout = 60 * 60 * 24 * 30  # 30 days
-            self.cache_prefix = 'geocoding'
-            
-            logger.info("GeocodingService initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize GeocodingService: {str(e)}")
-            raise
+    # =============================================================================
+    # LOCATION FILTERS (EXTRACT fields)
+    # =============================================================================
     
-    def geocode_shopping_center(self, shopping_center) -> Optional[GeocodingResult]:
-        """
-        Geocode a single shopping center and update its coordinates.
+    # Basic location filtering
+    city = CharFilter(
+        field_name='address_city',
+        lookup_expr='icontains',
+        help_text='Filter by city name (partial match)'
+    )
+    
+    state = CharFilter(
+        field_name='address_state',
+        lookup_expr='iexact',
+        help_text='Filter by state code (exact match, e.g., CA, NY)'
+    )
+    
+    zip_code = CharFilter(
+        field_name='address_zip',
+        lookup_expr='istartswith',
+        help_text='Filter by ZIP code (prefix match)'
+    )
+    
+    # Multiple city filtering
+    cities = CharFilter(
+        method='filter_multiple_cities',
+        help_text='Filter by multiple cities (comma-separated)'
+    )
+    
+    states = CharFilter(
+        method='filter_multiple_states', 
+        help_text='Filter by multiple states (comma-separated)'
+    )
+    
+    # =============================================================================
+    # SIZE AND TYPE FILTERS (EXTRACT + DETERMINE fields)
+    # =============================================================================
+    
+    # GLA range filtering
+    min_gla = NumberFilter(
+        field_name='total_gla',
+        lookup_expr='gte',
+        help_text='Minimum GLA in square feet'
+    )
+    
+    max_gla = NumberFilter(
+        field_name='total_gla',
+        lookup_expr='lte',
+        help_text='Maximum GLA in square feet'
+    )
+    
+    gla_range = CharFilter(
+        method='filter_gla_range',
+        help_text='GLA range filter (small, medium, large, xl)'
+    )
+    
+    # Center type filtering
+    center_type = ChoiceFilter(
+        field_name='center_type',
+        choices=[
+            ('Strip/Convenience', 'Strip/Convenience'),
+            ('Neighborhood Center', 'Neighborhood Center'),
+            ('Community Center', 'Community Center'),
+            ('Regional Mall', 'Regional Mall'),
+            ('Super-Regional Mall', 'Super-Regional Mall'),
+        ],
+        help_text='Filter by shopping center type'
+    )
+    
+    center_types = CharFilter(
+        method='filter_multiple_center_types',
+        help_text='Filter by multiple center types (comma-separated)'
+    )
+    
+    # =============================================================================
+    # DATA QUALITY FILTERS (DETERMINE fields)
+    # =============================================================================
+    
+    # Quality score filtering
+    min_quality = NumberFilter(
+        field_name='data_quality_score',
+        lookup_expr='gte',
+        help_text='Minimum data quality score (0-100)'
+    )
+    
+    max_quality = NumberFilter(
+        field_name='data_quality_score',
+        lookup_expr='lte',
+        help_text='Maximum data quality score (0-100)'
+    )
+    
+    quality_tier = ChoiceFilter(
+        method='filter_quality_tier',
+        choices=[
+            ('high', 'High Quality (80-100%)'),
+            ('medium', 'Medium Quality (50-79%)'),
+            ('low', 'Low Quality (0-49%)'),
+            ('incomplete', 'Needs Attention (<50%)')
+        ],
+        help_text='Filter by quality tier'
+    )
+    
+    # Geocoding status
+    has_coordinates = BooleanFilter(
+        method='filter_has_coordinates',
+        help_text='Filter by presence of lat/lng coordinates'
+    )
+    
+    # =============================================================================
+    # BUSINESS RELATIONSHIP FILTERS (DEFINE fields)
+    # =============================================================================
+    
+    # Ownership and management
+    owner = CharFilter(
+        field_name='owner',
+        lookup_expr='icontains',
+        help_text='Filter by owner name (partial match)'
+    )
+    
+    property_manager = CharFilter(
+        field_name='property_manager',
+        lookup_expr='icontains',
+        help_text='Filter by property manager (partial match)'
+    )
+    
+    leasing_agent = CharFilter(
+        field_name='leasing_agent',
+        lookup_expr='icontains',
+        help_text='Filter by leasing agent (partial match)'
+    )
+    
+    # Multiple business relationship filtering
+    owners = CharFilter(
+        method='filter_multiple_owners',
+        help_text='Filter by multiple owners (comma-separated)'
+    )
+    
+    # =============================================================================
+    # SPATIAL FILTERS (DETERMINE fields)
+    # =============================================================================
+    
+    # Proximity filtering - finds properties near a point
+    near_lat = NumberFilter(
+        method='filter_near_coordinates',
+        help_text='Latitude for proximity search (use with near_lng and radius)'
+    )
+    
+    near_lng = NumberFilter(
+        method='filter_near_coordinates',
+        help_text='Longitude for proximity search (use with near_lat and radius)'
+    )
+    
+    radius_miles = NumberFilter(
+        method='filter_near_coordinates',
+        help_text='Search radius in miles (use with near_lat and near_lng)'
+    )
+    
+    # Bounding box filtering for map views
+    bounds = CharFilter(
+        method='filter_map_bounds',
+        help_text='Map bounds: "sw_lat,sw_lng,ne_lat,ne_lng"'
+    )
+    
+    # =============================================================================
+    # TEMPORAL FILTERS
+    # =============================================================================
+    
+    created_after = DateFilter(
+        field_name='created_at',
+        lookup_expr='gte',
+        help_text='Filter by creation date (YYYY-MM-DD)'
+    )
+    
+    created_before = DateFilter(
+        field_name='created_at',
+        lookup_expr='lte',
+        help_text='Filter by creation date (YYYY-MM-DD)'
+    )
+    
+    updated_after = DateFilter(
+        field_name='updated_at',
+        lookup_expr='gte',
+        help_text='Filter by last update date (YYYY-MM-DD)'
+    )
+    
+    # =============================================================================
+    # TENANT-BASED FILTERS
+    # =============================================================================
+    
+    has_tenants = BooleanFilter(
+        method='filter_has_tenants',
+        help_text='Filter by presence of tenant data'
+    )
+    
+    min_tenant_count = NumberFilter(
+        method='filter_min_tenant_count',
+        help_text='Minimum number of tenants'
+    )
+    
+    max_vacancy_rate = NumberFilter(
+        method='filter_max_vacancy_rate',
+        help_text='Maximum vacancy rate percentage (0-100)'
+    )
+    
+    # =============================================================================
+    # PROGRESSIVE DATA FILTERS
+    # =============================================================================
+    
+    data_completeness = ChoiceFilter(
+        method='filter_data_completeness',
+        choices=[
+            ('extract_only', 'Extract fields only'),
+            ('has_determine', 'Has calculated fields'),
+            ('has_define', 'Has manual entry fields'),
+            ('fully_enriched', 'Fully enriched data')
+        ],
+        help_text='Filter by data enrichment level'
+    )
+    
+    class Meta:
+        model = ShoppingCenter
+        fields = {
+            # Additional simple field filters
+            'year_built': ['exact', 'gte', 'lte'],
+            'county': ['icontains'],
+            'municipality': ['icontains'],
+        }
+    
+    # =============================================================================
+    # CUSTOM FILTER METHODS
+    # =============================================================================
+    
+    def filter_multiple_cities(self, queryset, name, value):
+        """Filter by multiple cities (comma-separated list)"""
+        if not value:
+            return queryset
         
-        Args:
-            shopping_center: ShoppingCenter model instance
-            
-        Returns:
-            GeocodingResult with success status and coordinates
-        """
-        try:
-            # Build address string from shopping center fields
-            address_components = [
-                shopping_center.address_street,
-                shopping_center.address_city,
-                shopping_center.address_state,
-                shopping_center.address_zip
-            ]
-            
-            # Create full address string, filtering out empty components
-            full_address = ', '.join([comp.strip() for comp in address_components if comp and comp.strip()])
-            
-            if not full_address:
-                logger.warning(f"No address components available for {shopping_center.shopping_center_name}")
-                return GeocodingResult(success=False, error_message="No address components available")
-            
-            # Validate address before geocoding
-            validation_result = validate_address_components(
-                shopping_center.address_street or "",
-                shopping_center.address_city or "",
-                shopping_center.address_state or "",
-                shopping_center.address_zip or ""
-            )
-            
-            if not validation_result['geocoding_ready']:
-                logger.warning(f"Address not ready for geocoding: {shopping_center.shopping_center_name}")
-                error_msg = "; ".join(validation_result['errors'])
-                return GeocodingResult(success=False, error_message=f"Address validation failed: {error_msg}")
-            
-            # Perform geocoding
-            result = self.geocode_address(full_address)
-            
-            if result.success:
-                # Update shopping center with geocoding results
-                self._update_shopping_center_coordinates(shopping_center, result)
-                logger.info(f"Successfully geocoded {shopping_center.shopping_center_name}")
+        cities = [city.strip() for city in value.split(',') if city.strip()]
+        return queryset.filter(address_city__in=cities)
+    
+    def filter_multiple_states(self, queryset, name, value):
+        """Filter by multiple states (comma-separated list)"""
+        if not value:
+            return queryset
+        
+        states = [state.strip().upper() for state in value.split(',') if state.strip()]
+        return queryset.filter(address_state__in=states)
+    
+    def filter_gla_range(self, queryset, name, value):
+        """Filter by predefined GLA ranges"""
+        if not value:
+            return queryset
+        
+        range_mapping = {
+            'small': (0, 30000),        # Strip/Convenience
+            'medium': (30000, 125000),  # Neighborhood  
+            'large': (125000, 400000),  # Community
+            'xl': (400000, float('inf')) # Regional+
+        }
+        
+        if value.lower() in range_mapping:
+            min_gla, max_gla = range_mapping[value.lower()]
+            if max_gla == float('inf'):
+                return queryset.filter(total_gla__gte=min_gla)
             else:
-                logger.warning(f"Geocoding failed for {shopping_center.shopping_center_name}: {result.error_message}")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error geocoding shopping center {shopping_center.shopping_center_name}: {str(e)}")
-            return GeocodingResult(success=False, error_message=str(e))
-    
-    def geocode_address(self, address: str, use_cache: bool = True) -> GeocodingResult:
-        """
-        Geocode a single address string.
+                return queryset.filter(total_gla__gte=min_gla, total_gla__lt=max_gla)
         
-        Args:
-            address: Full address string to geocode
-            use_cache: Whether to use cached results
-            
-        Returns:
-            GeocodingResult with geocoding outcome
-        """
-        try:
-            # Clean the address
-            cleaned_address = clean_street_address(address)
-            
-            # Check cache first if enabled
-            if use_cache:
-                cached_result = self._get_cached_result(cleaned_address)
-                if cached_result:
-                    logger.debug(f"Using cached result for address: {cleaned_address}")
-                    return cached_result
-            
-            # Check rate limits before making API call
-            if not self._check_rate_limits():
-                return GeocodingResult(
-                    success=False,
-                    error_message="API rate limit exceeded. Please try again later."
-                )
-            
-            # Make Google Maps API call
-            logger.debug(f"Geocoding address: {cleaned_address}")
-            geocode_result = self.client.geocode(cleaned_address)
-            
-            if not geocode_result:
-                result = GeocodingResult(
-                    success=False,
-                    error_message="No results found for address",
-                    api_status="ZERO_RESULTS"
-                )
-            else:
-                # Parse the first (best) result
-                first_result = geocode_result[0]
-                location = first_result['geometry']['location']
-                
-                result = GeocodingResult(
-                    success=True,
-                    latitude=location['lat'],
-                    longitude=location['lng'],
-                    formatted_address=first_result.get('formatted_address'),
-                    place_id=first_result.get('place_id'),
-                    address_components=first_result.get('address_components'),
-                    geometry_type=first_result['geometry'].get('location_type'),
-                    location_type=first_result['geometry'].get('location_type'),
-                    viewport=first_result['geometry'].get('viewport'),
-                    confidence_score=self._calculate_confidence_score(first_result),
-                    api_status="OK"
-                )
-            
-            # Cache successful results
-            if use_cache and result.success:
-                self._cache_result(cleaned_address, result)
-            
-            # Update usage tracking
-            self._update_usage_stats()
-            
-            return result
-            
-        except googlemaps.exceptions.ApiError as e:
-            logger.error(f"Google Maps API error for address '{address}': {str(e)}")
-            return GeocodingResult(
-                success=False,
-                error_message=f"Google Maps API error: {str(e)}",
-                api_status=str(e)
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error geocoding address '{address}': {str(e)}")
-            return GeocodingResult(
-                success=False,
-                error_message=f"Geocoding error: {str(e)}"
-            )
+        return queryset
     
-    def batch_geocode_shopping_centers(self, shopping_center_ids: List[int], 
-                                     max_concurrent: int = 10) -> BatchGeocodingResult:
-        """
-        Geocode multiple shopping centers in batch with rate limiting.
+    def filter_multiple_center_types(self, queryset, name, value):
+        """Filter by multiple center types"""
+        if not value:
+            return queryset
         
-        Args:
-            shopping_center_ids: List of shopping center IDs to geocode
-            max_concurrent: Maximum concurrent API requests
-            
-        Returns:
-            BatchGeocodingResult with comprehensive results
+        types = [ct.strip() for ct in value.split(',') if ct.strip()]
+        return queryset.filter(center_type__in=types)
+    
+    def filter_quality_tier(self, queryset, name, value):
+        """Filter by quality score tiers"""
+        if not value:
+            return queryset
+        
+        tier_mapping = {
+            'high': (80, 100),
+            'medium': (50, 79),
+            'low': (1, 49),
+            'incomplete': (0, 49)
+        }
+        
+        if value in tier_mapping:
+            min_score, max_score = tier_mapping[value]
+            return queryset.filter(
+                data_quality_score__gte=min_score,
+                data_quality_score__lte=max_score
+            )
+        
+        return queryset
+    
+    def filter_has_coordinates(self, queryset, name, value):
+        """Filter by presence of geographic coordinates"""
+        if value is True:
+            return queryset.filter(
+                latitude__isnull=False,
+                longitude__isnull=False
+            )
+        elif value is False:
+            return queryset.filter(
+                models.Q(latitude__isnull=True) | models.Q(longitude__isnull=True)
+            )
+        return queryset
+    
+    def filter_multiple_owners(self, queryset, name, value):
+        """Filter by multiple owners"""
+        if not value:
+            return queryset
+        
+        owners = [owner.strip() for owner in value.split(',') if owner.strip()]
+        # Use OR logic for partial matches across multiple owners
+        q_objects = models.Q()
+        for owner in owners:
+            q_objects |= models.Q(owner__icontains=owner)
+        
+        return queryset.filter(q_objects)
+    
+    def filter_near_coordinates(self, queryset, name, value):
         """
-        start_time = time.time()
-        results = []
-        errors = []
-        successful_geocodes = 0
-        api_calls_used = 0
+        Spatial proximity filtering using PostGIS.
+        Requires near_lat, near_lng, and radius_miles parameters.
+        """
+        # This method gets called for each of the three parameters
+        # We need to check if all three are present in the request
+        request = self.request
+        lat = request.GET.get('near_lat')
+        lng = request.GET.get('near_lng') 
+        radius = request.GET.get('radius_miles')
+        
+        if not (lat and lng and radius):
+            return queryset
         
         try:
-            from properties.models import ShoppingCenter
+            lat = float(lat)
+            lng = float(lng)
+            radius = float(radius)
             
-            # Get shopping centers that need geocoding
-            centers_to_geocode = ShoppingCenter.objects.filter(
-                id__in=shopping_center_ids
+            # Create point and filter by distance
+            point = Point(lng, lat, srid=4326)
+            return queryset.filter(
+                latitude__isnull=False,
+                longitude__isnull=False
+            ).annotate(
+                distance=models.functions.Distance('location', point)
             ).filter(
-                latitude__isnull=True,
-                longitude__isnull=True
-            )
+                distance__lte=D(mi=radius)
+            ).order_by('distance')
             
-            total_centers = centers_to_geocode.count()
-            logger.info(f"Starting batch geocoding of {total_centers} shopping centers")
-            
-            # Process in batches to respect rate limits
-            batch_size = min(max_concurrent, self.requests_per_second)
-            
-            for i in range(0, total_centers, batch_size):
-                batch = centers_to_geocode[i:i + batch_size]
-                
-                # Process current batch
-                for center in batch:
-                    try:
-                        result = self.geocode_shopping_center(center)
-                        results.append((center.id, result))
-                        api_calls_used += 1
-                        
-                        if result.success:
-                            successful_geocodes += 1
-                        else:
-                            errors.append(f"Failed to geocode {center.shopping_center_name}: {result.error_message}")
-                        
-                        # Rate limiting delay
-                        time.sleep(1.0 / self.requests_per_second)
-                        
-                    except Exception as e:
-                        error_msg = f"Error processing {center.shopping_center_name}: {str(e)}"
-                        errors.append(error_msg)
-                        logger.error(error_msg)
-                
-                # Brief pause between batches
-                if i + batch_size < total_centers:
-                    time.sleep(1)
-            
-            processing_time = time.time() - start_time
-            
-            batch_result = BatchGeocodingResult(
-                total_addresses=total_centers,
-                successful_geocodes=successful_geocodes,
-                failed_geocodes=total_centers - successful_geocodes,
-                api_calls_used=api_calls_used,
-                processing_time_seconds=round(processing_time, 2),
-                results=results,
-                errors=errors
-            )
-            
-            logger.info(f"Batch geocoding completed: {successful_geocodes}/{total_centers} successful in {processing_time:.2f}s")
-            return batch_result
-            
-        except Exception as e:
-            logger.error(f"Error in batch geocoding: {str(e)}")
-            processing_time = time.time() - start_time
-            
-            return BatchGeocodingResult(
-                total_addresses=len(shopping_center_ids),
-                successful_geocodes=successful_geocodes,
-                failed_geocodes=len(shopping_center_ids) - successful_geocodes,
-                api_calls_used=api_calls_used,
-                processing_time_seconds=round(processing_time, 2),
-                results=results,
-                errors=errors + [f"Batch processing error: {str(e)}"]
-            )
+        except (ValueError, TypeError):
+            return queryset
     
-    def reverse_geocode(self, latitude: float, longitude: float) -> GeocodingResult:
-        """
-        Reverse geocode coordinates to address.
+    def filter_map_bounds(self, queryset, name, value):
+        """Filter by map viewport bounds"""
+        if not value:
+            return queryset
         
-        Args:
-            latitude: Latitude coordinate
-            longitude: Longitude coordinate
-            
-        Returns:
-            GeocodingResult with address information
-        """
         try:
-            if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
-                return GeocodingResult(
-                    success=False,
-                    error_message="Invalid coordinate range"
-                )
+            # Parse bounds: "sw_lat,sw_lng,ne_lat,ne_lng"
+            coords = [float(x.strip()) for x in value.split(',')]
+            if len(coords) != 4:
+                return queryset
             
-            # Check rate limits
-            if not self._check_rate_limits():
-                return GeocodingResult(
-                    success=False,
-                    error_message="API rate limit exceeded"
-                )
+            sw_lat, sw_lng, ne_lat, ne_lng = coords
             
-            # Make reverse geocoding API call
-            reverse_result = self.client.reverse_geocode((latitude, longitude))
-            
-            if not reverse_result:
-                return GeocodingResult(
-                    success=False,
-                    error_message="No address found for coordinates",
-                    api_status="ZERO_RESULTS"
-                )
-            
-            first_result = reverse_result[0]
-            
-            result = GeocodingResult(
-                success=True,
-                latitude=latitude,
-                longitude=longitude,
-                formatted_address=first_result.get('formatted_address'),
-                place_id=first_result.get('place_id'),
-                address_components=first_result.get('address_components'),
-                confidence_score=self._calculate_confidence_score(first_result),
-                api_status="OK"
+            return queryset.filter(
+                latitude__gte=sw_lat,
+                latitude__lte=ne_lat,
+                longitude__gte=sw_lng,
+                longitude__lte=ne_lng
             )
             
-            self._update_usage_stats()
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error reverse geocoding ({latitude}, {longitude}): {str(e)}")
-            return GeocodingResult(
-                success=False,
-                error_message=f"Reverse geocoding error: {str(e)}"
-            )
+        except (ValueError, TypeError):
+            return queryset
     
-    def validate_coordinates(self, latitude: float, longitude: float) -> bool:
-        """
-        Validate that coordinates are within reasonable bounds for US commercial real estate.
+    def filter_has_tenants(self, queryset, name, value):
+        """Filter by presence of tenant data"""
+        if value is True:
+            return queryset.annotate(
+                tenant_count=models.Count('tenants')
+            ).filter(tenant_count__gt=0)
+        elif value is False:
+            return queryset.annotate(
+                tenant_count=models.Count('tenants')
+            ).filter(tenant_count=0)
         
-        Args:
-            latitude: Latitude coordinate
-            longitude: Longitude coordinate
-            
-        Returns:
-            True if coordinates appear valid
-        """
-        try:
-            # Basic coordinate range validation
-            if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
-                return False
-            
-            # US bounds validation (approximate)
-            us_bounds = {
-                'north': 49.3457868,  # Northern border
-                'south': 24.7433195,  # Southern border  
-                'east': -66.9513812,  # Eastern border
-                'west': -171.791110,  # Western border (including Alaska)
-            }
-            
-            if not (us_bounds['south'] <= latitude <= us_bounds['north']):
-                logger.warning(f"Latitude {latitude} outside US bounds")
-                return False
-            
-            if not (us_bounds['west'] <= longitude <= us_bounds['east']):
-                logger.warning(f"Longitude {longitude} outside US bounds")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error validating coordinates: {str(e)}")
-            return False
+        return queryset
     
-    def get_quota_status(self) -> GeocodingQuotaStatus:
-        """
-        Get current API quota and usage status.
+    def filter_min_tenant_count(self, queryset, name, value):
+        """Filter by minimum number of tenants"""
+        if not value:
+            return queryset
         
-        Returns:
-            GeocodingQuotaStatus with usage information
-        """
         try:
-            # Get usage stats from cache
-            today = datetime.now().date()
-            usage_key = f"{self.cache_prefix}_usage_{today}"
-            current_usage = cache.get(usage_key, 0)
-            
-            remaining = max(0, self.requests_per_day - current_usage)
-            
-            # Calculate reset time (midnight)
-            reset_time = datetime.combine(today + timedelta(days=1), datetime.min.time())
-            
-            # Estimate cost (approximate Google Maps pricing)
-            estimated_cost = current_usage * 0.005  # $0.005 per request
-            
-            return GeocodingQuotaStatus(
-                daily_limit=self.requests_per_day,
-                current_usage=current_usage,
-                remaining_requests=remaining,
-                reset_time=reset_time,
-                rate_limit_per_second=self.requests_per_second,
-                estimated_cost_usd=round(estimated_cost, 2)
+            min_count = int(value)
+            return queryset.annotate(
+                tenant_count=models.Count('tenants')
+            ).filter(tenant_count__gte=min_count)
+        except (ValueError, TypeError):
+            return queryset
+    
+    def filter_max_vacancy_rate(self, queryset, name, value):
+        """Filter by maximum vacancy rate"""
+        if not value:
+            return queryset
+        
+        try:
+            max_rate = float(value)
+            # This would require more complex calculation
+            # For now, return queryset as-is
+            # TODO: Implement vacancy rate calculation in annotation
+            return queryset
+        except (ValueError, TypeError):
+            return queryset
+    
+    def filter_data_completeness(self, queryset, name, value):
+        """Filter by data enrichment completeness level"""
+        if not value:
+            return queryset
+        
+        if value == 'extract_only':
+            # Has basic extracted fields but minimal other data
+            return queryset.filter(
+                shopping_center_name__isnull=False,
+                owner__isnull=True,
+                property_manager__isnull=True
             )
-            
-        except Exception as e:
-            logger.error(f"Error getting quota status: {str(e)}")
-            return GeocodingQuotaStatus(0, 0, 0, datetime.now(), 0, 0.0)
+        elif value == 'has_determine':
+            # Has calculated/determined fields
+            return queryset.filter(
+                models.Q(center_type__isnull=False) |
+                models.Q(latitude__isnull=False, longitude__isnull=False)
+            )
+        elif value == 'has_define':
+            # Has manually entered strategic data
+            return queryset.filter(
+                models.Q(owner__isnull=False) |
+                models.Q(property_manager__isnull=False) |
+                models.Q(year_built__isnull=False)
+            )
+        elif value == 'fully_enriched':
+            # Has data across all categories
+            return queryset.filter(
+                shopping_center_name__isnull=False,
+                center_type__isnull=False,
+                owner__isnull=False,
+                data_quality_score__gte=80
+            )
+        
+        return queryset
+
+
+# =============================================================================
+# TENANT FILTERS
+# =============================================================================
+
+class TenantFilter(filters.FilterSet):
+    """
+    Comprehensive filtering for tenants with business and lease analysis support.
+    
+    Provides filtering capabilities for:
+    - Tenant identification and categorization
+    - Space and size filtering
+    - Occupancy and lease status filtering
+    - Business relationship filtering
+    - Multi-location tenant analysis
+    """
     
     # =============================================================================
-    # PRIVATE HELPER METHODS
+    # TENANT IDENTITY FILTERS
     # =============================================================================
     
-    def _update_shopping_center_coordinates(self, shopping_center, result: GeocodingResult):
-        """Update shopping center with geocoding results."""
-        try:
-            with transaction.atomic():
-                shopping_center.latitude = Decimal(str(result.latitude))
-                shopping_center.longitude = Decimal(str(result.longitude))
-                
-                # Update PostGIS Point field
-                shopping_center.location = Point(result.longitude, result.latitude)
-                
-                # Store additional geocoding metadata if available
-                if result.formatted_address:
-                    # Could store formatted address in a separate field if needed
-                    pass
-                
-                shopping_center.save(update_fields=['latitude', 'longitude', 'location'])
-                
-        except Exception as e:
-            logger.error(f"Error updating shopping center coordinates: {str(e)}")
-            raise
+    tenant_name = CharFilter(
+        field_name='tenant_name',
+        lookup_expr='icontains',
+        help_text='Filter by tenant name (partial match)'
+    )
     
-    def _get_cached_result(self, address: str) -> Optional[GeocodingResult]:
-        """Get cached geocoding result for address."""
-        try:
-            cache_key = self._get_cache_key(address)
-            cached_data = cache.get(cache_key)
-            
-            if cached_data:
-                return GeocodingResult(**cached_data)
-            
-            return None
-            
-        except Exception as e:
-            logger.warning(f"Error retrieving cached result: {str(e)}")
-            return None
+    tenant_names = CharFilter(
+        method='filter_multiple_tenant_names',
+        help_text='Filter by multiple tenant names (comma-separated)'
+    )
     
-    def _cache_result(self, address: str, result: GeocodingResult):
-        """Cache successful geocoding result."""
-        try:
-            if result.success:
-                cache_key = self._get_cache_key(address)
-                
-                # Convert dataclass to dict for caching
-                cache_data = {
-                    'success': result.success,
-                    'latitude': result.latitude,
-                    'longitude': result.longitude,
-                    'formatted_address': result.formatted_address,
-                    'place_id': result.place_id,
-                    'confidence_score': result.confidence_score,
-                    'api_status': result.api_status,
-                    'cached_at': timezone.now().isoformat()
-                }
-                
-                cache.set(cache_key, cache_data, self.cache_timeout)
-                logger.debug(f"Cached geocoding result for: {address}")
-                
-        except Exception as e:
-            logger.warning(f"Error caching result: {str(e)}")
+    suite_number = CharFilter(
+        field_name='tenant_suite_number',
+        lookup_expr='icontains',
+        help_text='Filter by suite number'
+    )
     
-    def _get_cache_key(self, address: str) -> str:
-        """Generate cache key for address."""
-        # Normalize address for consistent caching
-        normalized = address.lower().strip()
-        address_hash = hashlib.md5(normalized.encode()).hexdigest()
-        return f"{self.cache_prefix}_addr_{address_hash}"
+    # =============================================================================
+    # SHOPPING CENTER RELATIONSHIP FILTERS
+    # =============================================================================
     
-    def _check_rate_limits(self) -> bool:
-        """Check if we can make an API request within rate limits."""
-        try:
-            # Check daily limit
-            today = datetime.now().date()
-            usage_key = f"{self.cache_prefix}_usage_{today}"
-            current_usage = cache.get(usage_key, 0)
-            
-            if current_usage >= self.requests_per_day:
-                logger.warning("Daily API request limit exceeded")
-                return False
-            
-            # Check per-second limit (simplified)
-            second_key = f"{self.cache_prefix}_second_{int(time.time())}"
-            second_usage = cache.get(second_key, 0)
-            
-            if second_usage >= self.requests_per_second:
-                logger.warning("Per-second API request limit exceeded")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error checking rate limits: {str(e)}")
-            return True  # Allow request if we can't check limits
+    shopping_center = NumberFilter(
+        field_name='shopping_center__id',
+        help_text='Filter by shopping center ID'
+    )
     
-    def _update_usage_stats(self):
-        """Update API usage statistics."""
-        try:
-            # Update daily usage
-            today = datetime.now().date()
-            usage_key = f"{self.cache_prefix}_usage_{today}"
-            current_usage = cache.get(usage_key, 0)
-            cache.set(usage_key, current_usage + 1, 60 * 60 * 24)  # 24 hour expiry
-            
-            # Update per-second usage
-            second_key = f"{self.cache_prefix}_second_{int(time.time())}"
-            second_usage = cache.get(second_key, 0)
-            cache.set(second_key, second_usage + 1, 2)  # 2 second expiry
-            
-        except Exception as e:
-            logger.warning(f"Error updating usage stats: {str(e)}")
+    shopping_center_name = CharFilter(
+        field_name='shopping_center__shopping_center_name',
+        lookup_expr='icontains',
+        help_text='Filter by shopping center name'
+    )
     
-    def _calculate_confidence_score(self, geocode_result: Dict) -> float:
-        """
-        Calculate confidence score for geocoding result.
+    center_city = CharFilter(
+        field_name='shopping_center__address_city',
+        lookup_expr='icontains',
+        help_text='Filter by shopping center city'
+    )
+    
+    center_state = CharFilter(
+        field_name='shopping_center__address_state',
+        lookup_expr='iexact',
+        help_text='Filter by shopping center state'
+    )
+    
+    center_type = ChoiceFilter(
+        field_name='shopping_center__center_type',
+        choices=[
+            ('Strip/Convenience', 'Strip/Convenience'),
+            ('Neighborhood Center', 'Neighborhood Center'),
+            ('Community Center', 'Community Center'),
+            ('Regional Mall', 'Regional Mall'),
+            ('Super-Regional Mall', 'Super-Regional Mall'),
+        ],
+        help_text='Filter by shopping center type'
+    )
+    
+    # =============================================================================
+    # SPACE AND SIZE FILTERS
+    # =============================================================================
+    
+    min_square_footage = NumberFilter(
+        field_name='square_footage',
+        lookup_expr='gte',
+        help_text='Minimum tenant square footage'
+    )
+    
+    max_square_footage = NumberFilter(
+        field_name='square_footage',
+        lookup_expr='lte',
+        help_text='Maximum tenant square footage'
+    )
+    
+    size_category = ChoiceFilter(
+        method='filter_size_category',
+        choices=[
+            ('small', 'Small (0-2,000 SF)'),
+            ('medium', 'Medium (2,001-10,000 SF)'),
+            ('large', 'Large (10,001-50,000 SF)'),
+            ('anchor', 'Anchor (50,000+ SF)'),
+        ],
+        help_text='Filter by tenant size category'
+    )
+    
+    # =============================================================================
+    # OCCUPANCY AND STATUS FILTERS
+    # =============================================================================
+    
+    occupancy_status = ChoiceFilter(
+        field_name='occupancy_status',
+        choices=[
+            ('OCCUPIED', 'Occupied'),
+            ('VACANT', 'Vacant'),
+            ('PENDING', 'Pending'),
+            ('UNKNOWN', 'Unknown'),
+        ],
+        help_text='Filter by occupancy status'
+    )
+    
+    is_anchor = BooleanFilter(
+        field_name='is_anchor',
+        help_text='Filter by anchor tenant status'
+    )
+    
+    anchor_only = BooleanFilter(
+        method='filter_anchor_only',
+        help_text='Show only anchor tenants'
+    )
+    
+    # =============================================================================
+    # RETAIL CATEGORY FILTERS
+    # =============================================================================
+    
+    retail_category = CharFilter(
+        method='filter_retail_category',
+        help_text='Filter by retail category (supports multiple via comma separation)'
+    )
+    
+    category_contains = CharFilter(
+        method='filter_category_contains',
+        help_text='Filter tenants whose categories contain this term'
+    )
+    
+    # =============================================================================
+    # BUSINESS TYPE FILTERS
+    # =============================================================================
+    
+    ownership_type = ChoiceFilter(
+        field_name='ownership_type',
+        choices=[
+            ('Franchise', 'Franchise'),
+            ('Corporate', 'Corporate'),
+            ('Independent', 'Independent'),
+        ],
+        help_text='Filter by ownership type'
+    )
+    
+    # =============================================================================
+    # LEASE AND FINANCIAL FILTERS
+    # =============================================================================
+    
+    min_base_rent = NumberFilter(
+        field_name='base_rent',
+        lookup_expr='gte',
+        help_text='Minimum base rent'
+    )
+    
+    max_base_rent = NumberFilter(
+        field_name='base_rent',
+        lookup_expr='lte',
+        help_text='Maximum base rent'
+    )
+    
+    lease_term_min = NumberFilter(
+        field_name='lease_term',
+        lookup_expr='gte',
+        help_text='Minimum lease term in months'
+    )
+    
+    lease_term_max = NumberFilter(
+        field_name='lease_term',
+        lookup_expr='lte',
+        help_text='Maximum lease term in months'
+    )
+    
+    # Lease expiration analysis
+    lease_expires_within = NumberFilter(
+        method='filter_lease_expires_within',
+        help_text='Filter by leases expiring within X days'
+    )
+    
+    lease_status = ChoiceFilter(
+        method='filter_lease_status',
+        choices=[
+            ('active', 'Active'),
+            ('expiring_soon', 'Expiring Soon (< 6 months)'),
+            ('expired', 'Expired'),
+            ('unknown', 'Unknown/No Date'),
+        ],
+        help_text='Filter by lease status'
+    )
+    
+    # =============================================================================
+    # TEMPORAL FILTERS
+    # =============================================================================
+    
+    created_after = DateFilter(
+        field_name='created_at',
+        lookup_expr='gte',
+        help_text='Filter by creation date'
+    )
+    
+    updated_after = DateFilter(
+        field_name='updated_at',
+        lookup_expr='gte',
+        help_text='Filter by last update date'
+    )
+    
+    lease_commence_after = DateFilter(
+        field_name='lease_commence',
+        lookup_expr='gte',
+        help_text='Filter by lease commencement date'
+    )
+    
+    lease_expire_before = DateFilter(
+        field_name='lease_expiration',
+        lookup_expr='lte',
+        help_text='Filter by lease expiration date'
+    )
+    
+    # =============================================================================
+    # MULTI-LOCATION ANALYSIS FILTERS
+    # =============================================================================
+    
+    multi_location = BooleanFilter(
+        method='filter_multi_location',
+        help_text='Filter tenants with multiple locations'
+    )
+    
+    location_count_min = NumberFilter(
+        method='filter_location_count_min',
+        help_text='Minimum number of locations for this tenant'
+    )
+    
+    class Meta:
+        model = Tenant
+        fields = {
+            'credit_category': ['exact', 'icontains'],
+        }
+    
+    # =============================================================================
+    # CUSTOM FILTER METHODS
+    # =============================================================================
+    
+    def filter_multiple_tenant_names(self, queryset, name, value):
+        """Filter by multiple tenant names"""
+        if not value:
+            return queryset
         
-        Args:
-            geocode_result: Raw Google Maps geocoding result
-            
-        Returns:
-            Confidence score from 0.0 to 1.0
-        """
-        try:
-            base_score = 0.7  # Base confidence for any successful geocoding
-            
-            # Boost score based on location precision
-            location_type = geocode_result.get('geometry', {}).get('location_type', '')
-            
-            type_bonuses = {
-                'ROOFTOP': 0.3,         # Exact address
-                'RANGE_INTERPOLATED': 0.2,  # Street address range
-                'GEOMETRIC_CENTER': 0.1,    # Geometric center
-                'APPROXIMATE': 0.05         # Approximate location
-            }
-            
-            base_score += type_bonuses.get(location_type, 0)
-            
-            # Boost score based on address component completeness
-            address_components = geocode_result.get('address_components', [])
-            component_types = [comp.get('types', []) for comp in address_components]
-            
-            # Check for important address components
-            has_street_number = any('street_number' in types for types in component_types)
-            has_route = any('route' in types for types in component_types) 
-            has_locality = any('locality' in types for types in component_types)
-            has_postal_code = any('postal_code' in types for types in component_types)
-            
-            if has_street_number:
-                base_score += 0.05
-            if has_route:
-                base_score += 0.05
-            if has_locality:
-                base_score += 0.03
-            if has_postal_code:
-                base_score += 0.02
-            
-            return min(1.0, base_score)
-            
-        except Exception as e:
-            logger.warning(f"Error calculating confidence score: {str(e)}")
-            return 0.5  # Default moderate confidence
-    
-    def clear_geocoding_cache(self, older_than_days: int = 30):
-        """
-        Clear old geocoding cache entries.
+        names = [name.strip() for name in value.split(',') if name.strip()]
+        q_objects = models.Q()
+        for tenant_name in names:
+            q_objects |= models.Q(tenant_name__icontains=tenant_name)
         
-        Args:
-            older_than_days: Clear entries older than this many days
-        """
+        return queryset.filter(q_objects)
+    
+    def filter_size_category(self, queryset, name, value):
+        """Filter by predefined tenant size categories"""
+        if not value:
+            return queryset
+        
+        size_ranges = {
+            'small': (0, 2000),
+            'medium': (2001, 10000), 
+            'large': (10001, 50000),
+            'anchor': (50001, float('inf'))
+        }
+        
+        if value in size_ranges:
+            min_sf, max_sf = size_ranges[value]
+            if max_sf == float('inf'):
+                return queryset.filter(square_footage__gte=min_sf)
+            else:
+                return queryset.filter(
+                    square_footage__gte=min_sf,
+                    square_footage__lte=max_sf
+                )
+        
+        return queryset
+    
+    def filter_anchor_only(self, queryset, name, value):
+        """Filter to show only anchor tenants"""
+        if value is True:
+            return queryset.filter(is_anchor=True)
+        return queryset
+    
+    def filter_retail_category(self, queryset, name, value):
+        """Filter by retail categories (supports multiple categories)"""
+        if not value:
+            return queryset
+        
+        categories = [cat.strip() for cat in value.split(',') if cat.strip()]
+        
+        # Use array overlap filtering for PostgreSQL ArrayField
+        q_objects = models.Q()
+        for category in categories:
+            q_objects |= models.Q(retail_category__contains=[category])
+        
+        return queryset.filter(q_objects)
+    
+    def filter_category_contains(self, queryset, name, value):
+        """Filter categories containing a specific term"""
+        if not value:
+            return queryset
+        
+        # Search within the array field elements
+        return queryset.filter(
+            retail_category__contains=[value]
+        )
+    
+    def filter_lease_expires_within(self, queryset, name, value):
+        """Filter by lease expiring within specified days"""
+        if not value:
+            return queryset
+        
         try:
-            # This would require a more sophisticated cache implementation
-            # to track cache entry ages. For now, just log the request.
-            logger.info(f"Geocoding cache cleanup requested for entries older than {older_than_days} days")
+            days = int(value)
+            from django.utils import timezone
+            from datetime import timedelta
             
-            # In a production environment, you might implement this with
-            # a custom cache backend or periodic cleanup task
+            future_date = timezone.now().date() + timedelta(days=days)
             
-        except Exception as e:
-            logger.error(f"Error clearing geocoding cache: {str(e)}")
+            return queryset.filter(
+                lease_expiration__isnull=False,
+                lease_expiration__lte=future_date,
+                lease_expiration__gte=timezone.now().date()
+            )
+        except (ValueError, TypeError):
+            return queryset
+    
+    def filter_lease_status(self, queryset, name, value):
+        """Filter by calculated lease status"""
+        if not value:
+            return queryset
+        
+        from django.utils import timezone
+        from datetime import timedelta
+        
+        today = timezone.now().date()
+        six_months = today + timedelta(days=180)
+        
+        if value == 'active':
+            return queryset.filter(
+                lease_expiration__isnull=False,
+                lease_expiration__gt=six_months
+            )
+        elif value == 'expiring_soon':
+            return queryset.filter(
+                lease_expiration__isnull=False,
+                lease_expiration__lte=six_months,
+                lease_expiration__gte=today
+            )
+        elif value == 'expired':
+            return queryset.filter(
+                lease_expiration__isnull=False,
+                lease_expiration__lt=today
+            )
+        elif value == 'unknown':
+            return queryset.filter(lease_expiration__isnull=True)
+        
+        return queryset
+    
+    def filter_multi_location(self, queryset, name, value):
+        """Filter tenants that appear in multiple shopping centers"""
+        if value is not True:
+            return queryset
+        
+        # Find tenant names that appear more than once
+        multi_location_names = Tenant.objects.values('tenant_name').annotate(
+            location_count=models.Count('shopping_center', distinct=True)
+        ).filter(location_count__gt=1).values_list('tenant_name', flat=True)
+        
+        return queryset.filter(tenant_name__in=multi_location_names)
+    
+    def filter_location_count_min(self, queryset, name, value):
+        """Filter by minimum number of locations for tenant"""
+        if not value:
+            return queryset
+        
+        try:
+            min_count = int(value)
+            
+            # Subquery to count locations per tenant name
+            tenant_location_counts = Tenant.objects.values('tenant_name').annotate(
+                location_count=models.Count('shopping_center', distinct=True)
+            ).filter(location_count__gte=min_count).values_list('tenant_name', flat=True)
+            
+            return queryset.filter(tenant_name__in=tenant_location_counts)
+            
+        except (ValueError, TypeError):
+            return queryset
 
 
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 
-def geocode_address_simple(address: str) -> Optional[Tuple[float, float]]:
+def get_filter_choices(model_class, field_name):
     """
-    Simple address geocoding function that returns just coordinates.
+    Get distinct values for a field to populate filter choices dynamically.
     
-    Args:
-        address: Address string to geocode
-        
-    Returns:
-        Tuple of (latitude, longitude) or None if failed
+    Useful for populating dropdown filters with actual database values.
     """
     try:
-        service = GeocodingService()
-        result = service.geocode_address(address)
-        
-        if result.success and result.latitude and result.longitude:
-            return (result.latitude, result.longitude)
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error in simple geocoding: {str(e)}")
-        return None
-
-
-def is_valid_us_coordinates(latitude: float, longitude: float) -> bool:
-    """
-    Quick validation for US coordinates.
-    
-    Args:
-        latitude: Latitude coordinate
-        longitude: Longitude coordinate
-        
-    Returns:
-        True if coordinates are within US bounds
-    """
-    service = GeocodingService()
-    return service.validate_coordinates(latitude, longitude)
-
-
-def get_geocoding_stats() -> Dict[str, Any]:
-    """
-    Get current geocoding service statistics.
-    
-    Returns:
-        Dictionary with usage and performance stats
-    """
-    try:
-        service = GeocodingService()
-        quota_status = service.get_quota_status()
-        
-        return {
-            'api_quota': {
-                'daily_limit': quota_status.daily_limit,
-                'current_usage': quota_status.current_usage,
-                'remaining': quota_status.remaining_requests,
-                'usage_percentage': round((quota_status.current_usage / quota_status.daily_limit) * 100, 1)
-            },
-            'estimated_cost_today': quota_status.estimated_cost_usd,
-            'rate_limit_per_second': quota_status.rate_limit_per_second,
-            'cache_prefix': service.cache_prefix,
-            'service_status': 'operational'
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting geocoding stats: {str(e)}")
-        return {
-            'service_status': 'error',
-            'error_message': str(e)
-        }
-
-
-# =============================================================================
-# DJANGO MANAGEMENT COMMAND HELPERS
-# =============================================================================
-
-def geocode_all_missing_coordinates(batch_size: int = 50, 
-                                  max_daily_requests: int = 1000) -> Dict[str, Any]:
-    """
-    Geocode all shopping centers missing coordinates.
-    
-    Args:
-        batch_size: Number of centers to process per batch
-        max_daily_requests: Maximum API requests to make today
-        
-    Returns:
-        Summary of geocoding operation
-    """
-    try:
-        from properties.models import ShoppingCenter
-        
-        # Find shopping centers without coordinates
-        centers_needing_geocoding = ShoppingCenter.objects.filter(
-            latitude__isnull=True,
-            longitude__isnull=True
+        distinct_values = model_class.objects.exclude(
+            **{f'{field_name}__isnull': True}
         ).exclude(
-            address_street__isnull=True,
-            address_city__isnull=True
-        )
+            **{f'{field_name}__exact': ''}
+        ).values_list(field_name, flat=True).distinct().order_by(field_name)
         
-        total_centers = centers_needing_geocoding.count()
-        
-        if total_centers == 0:
-            return {
-                'status': 'complete',
-                'message': 'All shopping centers already have coordinates',
-                'centers_processed': 0
-            }
-        
-        # Check current API usage
-        service = GeocodingService()
-        quota_status = service.get_quota_status()
-        
-        available_requests = min(
-            quota_status.remaining_requests,
-            max_daily_requests
-        )
-        
-        if available_requests <= 0:
-            return {
-                'status': 'quota_exceeded',
-                'message': 'API quota exceeded for today',
-                'centers_remaining': total_centers
-            }
-        
-        # Process in batches
-        centers_to_process = min(total_centers, available_requests)
-        center_ids = list(centers_needing_geocoding.values_list('id', flat=True)[:centers_to_process])
-        
-        result = service.batch_geocode_shopping_centers(center_ids, batch_size)
-        
-        return {
-            'status': 'completed',
-            'centers_processed': result.successful_geocodes,
-            'centers_failed': result.failed_geocodes,
-            'api_calls_used': result.api_calls_used,
-            'processing_time': result.processing_time_seconds,
-            'success_rate': round((result.successful_geocodes / result.total_addresses) * 100, 1),
-            'remaining_centers': total_centers - centers_to_process,
-            'errors': result.errors[:10]  # First 10 errors
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in batch geocoding operation: {str(e)}")
-        return {
-            'status': 'error',
-            'message': str(e),
-            'centers_processed': 0
-        }
+        return [(value, value) for value in distinct_values if value]
+    except Exception:
+        return []
+
+
+def get_shopping_center_filter_stats():
+    """Get statistics about filterable shopping center data."""
+    from django.db.models import Count, Min, Max, Avg
+    
+    stats = ShoppingCenter.objects.aggregate(
+        total_centers=Count('id'),
+        avg_gla=Avg('total_gla'),
+        min_gla=Min('total_gla'),
+        max_gla=Max('total_gla'),
+        avg_quality=Avg('data_quality_score'),
+        centers_with_coordinates=Count('id', filter=models.Q(latitude__isnull=False)),
+        centers_with_tenants=Count('id', filter=models.Q(tenants__isnull=False))
+    )
+    
+    # Get distinct values for key categorical fields
+    stats['distinct_states'] = list(ShoppingCenter.objects.exclude(
+        address_state__isnull=True
+    ).values_list('address_state', flat=True).distinct())
+    
+    stats['distinct_center_types'] = list(ShoppingCenter.objects.exclude(
+        center_type__isnull=True
+    ).values_list('center_type', flat=True).distinct())
+    
+    return stats
+
+
+def get_tenant_filter_stats():
+    """Get statistics about filterable tenant data."""
+    from django.db.models import Count, Min, Max, Avg
+    
+    stats = Tenant.objects.aggregate(
+        total_tenants=Count('id'),
+        occupied_tenants=Count('id', filter=models.Q(occupancy_status='OCCUPIED')),
+        anchor_tenants=Count('id', filter=models.Q(is_anchor=True)),
+        avg_square_footage=Avg('square_footage'),
+        min_square_footage=Min('square_footage'),
+        max_square_footage=Max('square_footage'),
+        avg_base_rent=Avg('base_rent')
+    )
+    
+    # Multi-location analysis
+    multi_location_count = Tenant.objects.values('tenant_name').annotate(
+        location_count=Count('shopping_center', distinct=True)
+    ).filter(location_count__gt=1).count()
+    
+    stats['multi_location_tenants'] = multi_location_count
+    
+    return stats
 
 
 # =============================================================================
-# EXPORT FUNCTIONS
+# EXPORT
 # =============================================================================
 
 __all__ = [
-    'GeocodingService',
-    'GeocodingResult', 
-    'BatchGeocodingResult',
-    'GeocodingQuotaStatus',
-    'geocode_address_simple',
-    'is_valid_us_coordinates',
-    'get_geocoding_stats',
-    'geocode_all_missing_coordinates'
+    'ShoppingCenterFilter',
+    'TenantFilter', 
+    'get_filter_choices',
+    'get_shopping_center_filter_stats',
+    'get_tenant_filter_stats'
 ]
